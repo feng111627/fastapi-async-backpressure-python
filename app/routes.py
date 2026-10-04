@@ -92,21 +92,23 @@ class ProcessResponse(BaseModel):
 def _error_response(exc: ThrottledError) -> JSONResponse:
     status = REJECT_STATUS[exc.reason]
     headers: dict[str, str] = {}
-    if exc.reason is RejectReason.RATE_LIMITED and exc.retry_after is not None:
-        headers["Retry-After"] = f"{max(0.0, exc.retry_after):.3f}"
-    return JSONResponse(
-        status_code=status,
-        content={
-            "accepted": False,
-            "error": {
-                "reason": exc.reason.value,
-                "business": exc.business,
-                "resource": exc.resource,
-                "detail": exc.detail,
-            },
+    content: dict[str, object] = {
+        "accepted": False,
+        "error": {
+            "reason": exc.reason.value,
+            "business": exc.business,
+            "resource": exc.resource,
+            "detail": exc.detail,
         },
-        headers=headers,
-    )
+    }
+    if exc.reason in (
+        RejectReason.RATE_LIMITED,
+        RejectReason.GLOBAL_RATE_LIMITED,
+    ) and exc.retry_after is not None:
+        retry = max(0.0, exc.retry_after)
+        headers["Retry-After"] = f"{retry:.3f}"
+        content["error"]["retry_after"] = round(retry, 3)  # type: ignore[index]
+    return JSONResponse(status_code=status, content=content, headers=headers)
 
 
 @router.get("/")
@@ -168,23 +170,65 @@ async def process_business(
 
 @router.get("/status")
 async def status(request: Request) -> dict[str, object]:
-    """观测接口：每个业务维度的额度/排队/拒绝计数。"""
+    """观测接口：全局层 + 各业务维度的额度/排队/窗口用量/拒绝计数。
+
+    纯只读：不申请任何额度、不重置任何计数、不影响限流判定。
+    """
     manager = _manager(request)
     registry = manager.registry
+    settings = manager.settings
+
     snapshot: dict[str, object] = {}
-    for name, entry in registry._entries.items():  # noqa: SLF001 - 观测读取
-        gate = entry.gate
+    for name in registry.known_dimensions():
+        gate = registry.peek_gate(name)
+        limiter = registry.peek_rate_limiter(name)
+        cfg = settings.get(name)
+        rate = (
+            limiter.stats(name)
+            if limiter is not None
+            else None
+        )
         snapshot[name] = {
-            "active": gate.active,
-            "waiting": gate.waiting,
-            "capacity": gate.capacity,
-            "max_queue": gate.max_queue,
-            "admitted": gate.total_admitted,
-            "queue_full": gate.total_queue_full,
-            "queue_timeout": gate.total_queue_timeout,
-            "rate_used": entry.rate_limiter.used(name),
+            "active": gate.active if gate is not None else 0,
+            "waiting": gate.waiting if gate is not None else 0,
+            "capacity": gate.capacity if gate is not None else cfg.max_concurrency,
+            "max_queue": gate.max_queue if gate is not None else cfg.max_queue,
+            "admitted": gate.total_admitted if gate is not None else 0,
+            "queue_full": gate.total_queue_full if gate is not None else 0,
+            "queue_timeout": (
+                gate.total_queue_timeout if gate is not None else 0
+            ),
+            "rate": {
+                "limit": rate.limit if rate is not None else cfg.rate_limit,
+                "window": rate.window if rate is not None else cfg.rate_window,
+                "used": rate.used if rate is not None else 0,
+                "remaining": (
+                    rate.remaining if rate is not None else cfg.rate_limit
+                ),
+                "rejected": rate.rejected if rate is not None else 0,
+                "retry_after": (
+                    round(rate.retry_after, 3) if rate is not None else 0.0
+                ),
+            },
         }
+
+    gl = manager.global_limiter
+    grate = gl.rate_stats()
     return {
+        "global": {
+            "active": gl.active,
+            "capacity": gl.capacity,
+            "admitted": gl.total_admitted,
+            "concurrency_rejected": gl.total_concurrency_rejected,
+            "rate": {
+                "limit": grate.limit,
+                "window": grate.window,
+                "used": grate.used,
+                "remaining": grate.remaining,
+                "rejected": grate.rejected,
+                "retry_after": round(grate.retry_after, 3),
+            },
+        },
         "dimensions": snapshot,
         "dimension_count": registry.active_dimensions(),
         "singleflights": {

@@ -1,9 +1,12 @@
 """按业务维度管理 RateLimiter / ConcurrencyGate 实例。
 
-- 维度首次出现时按配置创建限流器与并发闸门。
-- 每次申请前先做一轮空闲回收：active=0 且 waiting=0 的闸门
-  （连同限流器窗口状态）会被移除，保证压测大量不同维度后
-  注册表不会无限膨胀。
+- 维度首次出现时按配置创建并发闸门与限流器。
+- 并发闸门空闲即回收：active=0 且 waiting=0 的闸门会被移除，
+  保证压测大量不同维度后注册表不会无限膨胀。
+- **限流窗口状态不随闸门回收**：慢速串行流量下，请求与请求之间
+  闸门往往处于空闲状态，若连同限流窗口一起删掉，已用掉的额度会被
+  悄悄清零，单位时间限制就只剩“挤在一起猛打”时才生效。因此限流器
+  单独存放，只有窗口按真实时间自然过期后才允许回收。
 - ``gate_slot`` 以异步上下文管理器形式封装“限流检查 -> 排队进场 ->
   出场回收额度”，异常/取消路径也能正确释放。
 """
@@ -20,9 +23,9 @@ from .rate_limit import RateLimiter
 
 
 class _Entry:
-    """单个业务维度持有的运行时资源。"""
+    """单个业务维度持有的运行时资源（并发闸门）。"""
 
-    __slots__ = ("gate", "rate_limiter")
+    __slots__ = ("gate",)
 
     def __init__(self, cfg: BusinessConfig) -> None:
         self.gate = ConcurrencyGate(
@@ -31,18 +34,18 @@ class _Entry:
             max_queue=cfg.max_queue,
             queue_timeout=cfg.queue_timeout,
         )
-        self.rate_limiter = RateLimiter(cfg.rate_limit, cfg.rate_window)
 
 
 class GateRegistry:
-    """限流器与并发闸门的注册表。"""
+    """并发闸门（可回收）与限流器（窗口期内保留）的注册表。"""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._entries: dict[str, _Entry] = {}
+        self._rate_limiters: dict[str, RateLimiter] = {}
         self._lock = asyncio.Lock()
 
-    def _get_or_create(self, business: str) -> tuple[BusinessConfig, _Entry | None]:
+    def _get_or_create(self, business: str) -> tuple[BusinessConfig, _Entry]:
         """取已有维度；不存在则按配置创建。调用方需持有 _lock。"""
         cfg = self._settings.get(business)
         entry = self._entries.get(business)
@@ -51,8 +54,22 @@ class GateRegistry:
             self._entries[business] = entry
         return cfg, entry
 
+    def _rate_limiter_locked(self, business: str) -> RateLimiter:
+        """取/建业务限流器（独立于闸门生命周期）。调用方需持有 _lock。"""
+        limiter = self._rate_limiters.get(business)
+        if limiter is None:
+            cfg = self._settings.get(business)
+            limiter = RateLimiter(cfg.rate_limit, cfg.rate_window)
+            self._rate_limiters[business] = limiter
+        return limiter
+
     def _prune_idle_locked(self) -> None:
-        """回收完全空闲的维度。调用方需持有 _lock。"""
+        """回收完全空闲的维度。调用方需持有 _lock。
+
+        闸门：active=0 且 waiting=0 即回收。
+        限流器：只有窗口已按真实时间自然过期才回收——
+        窗口仍在生效时删除会把窗口内已用额度清零，必须保留。
+        """
         idle = [
             name
             for name, entry in self._entries.items()
@@ -60,6 +77,13 @@ class GateRegistry:
         ]
         for name in idle:
             del self._entries[name]
+        expired = [
+            name
+            for name, limiter in self._rate_limiters.items()
+            if limiter.window_expired(name)
+        ]
+        for name in expired:
+            del self._rate_limiters[name]
 
     async def prune_idle(self) -> int:
         """主动回收空闲维度，返回回收数量（测试/观测用）。"""
@@ -80,6 +104,28 @@ class GateRegistry:
             entry = _Entry(cfg)
             self._entries[business] = entry
         return entry.gate
+
+    def rate_limiter_for(self, business: str) -> RateLimiter:
+        """同步获取/创建限流器（观测/状态查询用，纯读取不消耗额度）。"""
+        limiter = self._rate_limiters.get(business)
+        if limiter is None:
+            cfg = self._settings.get(business)
+            limiter = RateLimiter(cfg.rate_limit, cfg.rate_window)
+            self._rate_limiters[business] = limiter
+        return limiter
+
+    def known_dimensions(self) -> list[str]:
+        """当前有闸门或限流状态的全部业务维度（观测用）。"""
+        return sorted(set(self._entries) | set(self._rate_limiters))
+
+    def peek_gate(self, business: str) -> ConcurrencyGate | None:
+        """只读获取闸门，不存在时返回 None（状态查询用，不创建、不改状态）。"""
+        entry = self._entries.get(business)
+        return entry.gate if entry is not None else None
+
+    def peek_rate_limiter(self, business: str) -> RateLimiter | None:
+        """只读获取限流器，不存在时返回 None（状态查询用）。"""
+        return self._rate_limiters.get(business)
 
     @asynccontextmanager
     async def gate_slot(
@@ -104,7 +150,8 @@ class GateRegistry:
             self._prune_idle_locked()
             _, entry = self._get_or_create(business)
             if check_rate:
-                await entry.rate_limiter.acquire(business, business=business)
+                limiter = self._rate_limiter_locked(business)
+                await limiter.acquire(business, business=business)
             gate = entry.gate
         finally:
             # 注意：紧接着的 gate.acquire() 同步前导段会让维度进入

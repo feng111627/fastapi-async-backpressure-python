@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 
 @dataclass(frozen=True)
@@ -108,11 +108,48 @@ def _apply_env_overrides(cfg: BusinessConfig) -> BusinessConfig:
 
 
 @dataclass(frozen=True)
+class GlobalConfig:
+    """全服务共享的容量保护配置（叠在各业务自己的限制之上）。
+
+    - ``max_concurrency``：三个业务合起来允许同时处理的最大请求数，
+      触顶立即拒绝（GLOBAL_CONCURRENCY），全局层不排队。
+    - ``rate_limit`` / ``rate_window``：全服务每 ``rate_window`` 秒
+      最多放行的请求数（固定窗口），超限立即拒绝（GLOBAL_RATE_LIMITED）。
+    """
+
+    max_concurrency: int = 10
+    rate_limit: int = 50
+    rate_window: float = 1.0
+
+
+DEFAULT_GLOBAL_CONFIG = GlobalConfig()
+
+# 支持用 BP_GLOBAL_{字段} 覆盖全局默认值
+_GLOBAL_INT_FIELDS = ("max_concurrency", "rate_limit")
+_GLOBAL_FLOAT_FIELDS = ("rate_window",)
+
+
+def _apply_global_env_overrides(cfg: GlobalConfig) -> GlobalConfig:
+    """从环境变量读取 BP_GLOBAL_{FIELD} 形式的覆盖项。"""
+    changes: dict[str, object] = {}
+    for f in _GLOBAL_INT_FIELDS:
+        raw = os.getenv("BP_GLOBAL_" + f.upper())
+        if raw is not None:
+            changes[f] = int(raw)
+    for f in _GLOBAL_FLOAT_FIELDS:
+        raw = os.getenv("BP_GLOBAL_" + f.upper())
+        if raw is not None:
+            changes[f] = float(raw)
+    return replace(cfg, **changes) if changes else cfg
+
+
+@dataclass(frozen=True)
 class Settings:
-    """全部业务维度的配置集合。"""
+    """全部业务维度的配置集合 + 全局容量保护配置。"""
 
     businesses: dict[str, BusinessConfig]
     default: BusinessConfig
+    global_: GlobalConfig = field(default_factory=GlobalConfig)
 
     def get(self, business: str) -> BusinessConfig:
         """返回业务配置，未注册则返回兜底配置的副本。"""
@@ -128,4 +165,8 @@ def load_settings() -> Settings:
         name: _apply_env_overrides(cfg)
         for name, cfg in BUSINESS_DEFAULTS.items()
     }
-    return Settings(businesses=businesses, default=DEFAULT_CONFIG)
+    return Settings(
+        businesses=businesses,
+        default=DEFAULT_CONFIG,
+        global_=_apply_global_env_overrides(DEFAULT_GLOBAL_CONFIG),
+    )

@@ -34,7 +34,7 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.config import BusinessConfig, Settings  # noqa: E402
+from app.config import BusinessConfig, GlobalConfig, Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.manager import BackpressureManager  # noqa: E402
 
@@ -105,10 +105,13 @@ async def phase_burst_backpressure(client: httpx.AsyncClient) -> None:
     results = await asyncio.gather(*(one(i) for i in range(n)))
     dist = Counter(results)
     reasons_seen = set(dist)
-    # 必然出现成功与至少一种拒绝；拒绝原因必须是可区分的三类之一
+    # 必然出现成功与至少一种拒绝；拒绝原因必须是可区分的几类之一
+    # （业务层：rate_limited/queue_full/queue_timeout；
+    #   全局层：global_rate_limited/global_concurrency）
     rejected = {r for r in reasons_seen if not r.startswith("200")}
     expected_reject_prefixes = {
-        "429:rate_limited", "503:queue_full", "408:queue_timeout"
+        "429:rate_limited", "503:queue_full", "408:queue_timeout",
+        "429:global_rate_limited", "503:global_concurrency",
     }
     ok = (
         dist.get("200", 0) > 0
@@ -248,6 +251,11 @@ async def run_load(base_url: str | None) -> bool:
                 ),
             },
             default=BusinessConfig(business="default"),
+            # 全局层：叠在业务层之上的共享容量保护；阈值高于各业务合计，
+            # 让业务层拒绝优先出现，同时防止单业务爆量吃光全局资源
+            global_=GlobalConfig(
+                max_concurrency=12, rate_limit=200, rate_window=1.0
+            ),
         )
         app = create_app()
         app.state.settings = settings
