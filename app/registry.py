@@ -52,11 +52,19 @@ class GateRegistry:
         return cfg, entry
 
     def _prune_idle_locked(self) -> None:
-        """回收完全空闲的维度。调用方需持有 _lock。"""
+        """回收完全空闲的维度。调用方需持有 _lock。
+
+        “完全空闲”= 闸门无执行/排队 且 限流窗口已自然过期。
+        窗口仍在生效的维度必须保留：否则慢速串行流量（请求一个个来、
+        闸门在间隙回到空闲）会把窗口内已用掉的量悄悄清零，限流失效。
+        窗口过期后已用量本就归零，此时回收不影响任何判定。
+        """
         idle = [
             name
             for name, entry in self._entries.items()
-            if entry.gate.active == 0 and entry.gate.waiting == 0
+            if entry.gate.active == 0
+            and entry.gate.waiting == 0
+            and entry.rate_limiter.is_idle(name)
         ]
         for name in idle:
             del self._entries[name]

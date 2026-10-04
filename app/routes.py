@@ -18,7 +18,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .errors import REJECT_STATUS, RejectReason, ThrottledError
+from .errors import RATE_REASONS, REJECT_STATUS, ThrottledError
 from .manager import BackpressureManager
 from .services import HANDLERS
 
@@ -92,7 +92,7 @@ class ProcessResponse(BaseModel):
 def _error_response(exc: ThrottledError) -> JSONResponse:
     status = REJECT_STATUS[exc.reason]
     headers: dict[str, str] = {}
-    if exc.reason is RejectReason.RATE_LIMITED and exc.retry_after is not None:
+    if exc.reason in RATE_REASONS and exc.retry_after is not None:
         headers["Retry-After"] = f"{max(0.0, exc.retry_after):.3f}"
     return JSONResponse(
         status_code=status,
@@ -168,7 +168,10 @@ async def process_business(
 
 @router.get("/status")
 async def status(request: Request) -> dict[str, object]:
-    """观测接口：每个业务维度的额度/排队/拒绝计数。"""
+    """观测接口：全局层 + 各业务维度的额度/排队/窗口用量与拒绝计数。
+
+    纯只读：不消耗任何限流额度，也不影响任何限流判定。
+    """
     manager = _manager(request)
     registry = manager.registry
     snapshot: dict[str, object] = {}
@@ -182,9 +185,10 @@ async def status(request: Request) -> dict[str, object]:
             "admitted": gate.total_admitted,
             "queue_full": gate.total_queue_full,
             "queue_timeout": gate.total_queue_timeout,
-            "rate_used": entry.rate_limiter.used(name),
+            "rate": entry.rate_limiter.snapshot(name),
         }
     return {
+        "global": manager.global_limiter.snapshot(),
         "dimensions": snapshot,
         "dimension_count": registry.active_dimensions(),
         "singleflights": {

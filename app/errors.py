@@ -1,11 +1,18 @@
 """拒绝原因与异常类型。
 
-四类可区分的反馈，HTTP 状态码也不同，客户端/压测可以精确统计：
+可区分的反馈，HTTP 状态码也不同，客户端/压测可以精确统计：
 
-- RATE_LIMITED   429：超过单位时间请求量，立即失败（没有排队）。
-- QUEUE_FULL     503：并发已满且排队队列也满，立即失败（防止无限堆积）。
+业务维度（各业务自己的额度）：
+
+- RATE_LIMITED   429：超过该业务单位时间请求量，立即失败（没有排队）。
+- QUEUE_FULL     503：该业务并发已满且排队队列也满，立即失败（防止无限堆积）。
 - QUEUE_TIMEOUT  408：进入了队列但在 ``queue_timeout`` 内没拿到并发额度。
 - PROCESSING_TIMEOUT 504：已经开始处理，但处理时长超过 ``processing_timeout``。
+
+全服务共享（全局容量保护，叠在业务限制之上，触发即拒、不排队）：
+
+- GLOBAL_RATE_LIMITED 429：所有业务合计超过全局单位时间放行上限。
+- GLOBAL_CONCURRENCY  503：所有业务合计在途处理数达到全局上限。
 """
 
 from __future__ import annotations
@@ -20,6 +27,8 @@ class RejectReason(str, enum.Enum):
     QUEUE_FULL = "queue_full"
     QUEUE_TIMEOUT = "queue_timeout"
     PROCESSING_TIMEOUT = "processing_timeout"
+    GLOBAL_RATE_LIMITED = "global_rate_limited"
+    GLOBAL_CONCURRENCY = "global_concurrency"
 
 
 # 各原因对应的 HTTP 状态码
@@ -28,7 +37,15 @@ REJECT_STATUS: dict[RejectReason, int] = {
     RejectReason.QUEUE_FULL: 503,
     RejectReason.QUEUE_TIMEOUT: 408,
     RejectReason.PROCESSING_TIMEOUT: 504,
+    RejectReason.GLOBAL_RATE_LIMITED: 429,
+    RejectReason.GLOBAL_CONCURRENCY: 503,
 }
+
+
+# 携带 Retry-After 响应头的限流类原因
+RATE_REASONS = frozenset(
+    {RejectReason.RATE_LIMITED, RejectReason.GLOBAL_RATE_LIMITED}
+)
 
 
 class ThrottledError(Exception):

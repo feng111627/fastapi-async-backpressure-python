@@ -2,14 +2,17 @@
 
 请求生命周期（所有路径都保证资源归还）::
 
-    RATE_LIMITED 快速失败（不占任何资源）
+    GLOBAL_RATE_LIMITED 快速失败（全局层，不占任何资源）
+      -> RATE_LIMITED 快速失败（业务层，不占任何资源）
+      -> 全局在途名额（GLOBAL_CONCURRENCY 快速失败，不排队；
+         从排队到处理结束全程持有，finally 归还）
       -> 若启用 single-flight：原子登记
            - leader：进入 gate 排队（QUEUE_FULL / QUEUE_TIMEOUT），
              拿到额度后真实执行，成功分发、失败/超时广播且不缓存；
-           - 等待者：不占 gate 额度，直接共享 leader 结果，
+           - 等待者：不占 gate 与全局在途额度，直接共享 leader 结果，
              各自受 processing_timeout 约束，取消只影响自己。
          未启用：每个请求各自进入 gate 排队执行。
-      -> 客户端断开/取消/异常：gate 额度在 finally 中归还。
+      -> 客户端断开/取消/异常：全局在途名额与 gate 额度都在 finally 中归还。
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from typing import Any, Awaitable, Callable
 
 from .config import Settings
 from .errors import RejectReason, ThrottledError
+from .global_limit import GlobalLimiter
 from .registry import GateRegistry
 from .singleflight import LeaderToken, SingleFlight
 
@@ -40,6 +44,7 @@ class BackpressureManager:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.registry = GateRegistry(settings)
+        self.global_limiter = GlobalLimiter(settings.global_limit)
         self._singleflights: dict[str, SingleFlight] = {
             name: SingleFlight(name)
             for name, cfg in settings.businesses.items()
@@ -75,6 +80,10 @@ class BackpressureManager:
         """限流 + 排队 + 合并 + 超时地执行一次业务调用。"""
         cfg = self.settings.get(business)
 
+        # 1) 全局单位时间放行上限：所有请求（含合并等待者）都计数，
+        #    超限立即拒绝，不占任何其他资源
+        await self.global_limiter.acquire_rate(business=business)
+
         sf: SingleFlight | None = None
         if cfg.singleflight:
             sf = self._singleflights.get(business)
@@ -85,14 +94,16 @@ class BackpressureManager:
         key = f"{business}:{resource}"
 
         if sf is None:
-            # 未启用合并：gate_slot 内部统一做限流检查，不重复计数
-            async with self.registry.gate_slot(business):
-                payload = await self._run_with_timeout(
-                    business, resource, handler, cfg, kwargs
-                )
+            # 未启用合并：先占全局在途名额（满即拒、不排队），
+            # gate_slot 内部统一做业务限流检查，不重复计数
+            with self.global_limiter.slot(business):
+                async with self.registry.gate_slot(business):
+                    payload = await self._run_with_timeout(
+                        business, resource, handler, cfg, kwargs
+                    )
             return DispatchResult(payload=payload, coalesced=False)
 
-        # 启用合并：所有请求先过限流（含等待者，保证 QPS 口径一致）
+        # 启用合并：所有请求先过业务限流（含等待者，保证 QPS 口径一致）
         await self._acquire_rate_limit(business)
 
         # 2) 原子加入合并 flight（此处之前不允许出现 await）
@@ -102,13 +113,15 @@ class BackpressureManager:
             assert isinstance(handle, LeaderToken)
             token = handle
             try:
-                # 只有 leader 占用并发/排队额度；限流已在上方完成，跳过重复检查
-                async with self.registry.gate_slot(
-                    business, check_rate=False
-                ):
-                    payload = await self._run_with_timeout(
-                        business, resource, handler, cfg, kwargs
-                    )
+                # 只有 leader 占用全局在途名额与业务并发/排队额度；
+                # 业务限流已在上方完成，跳过重复检查
+                with self.global_limiter.slot(business):
+                    async with self.registry.gate_slot(
+                        business, check_rate=False
+                    ):
+                        payload = await self._run_with_timeout(
+                            business, resource, handler, cfg, kwargs
+                        )
             except BaseException as exc:
                 # 失败/超时/取消都广播出去，且不缓存结果
                 token.fail(exc)

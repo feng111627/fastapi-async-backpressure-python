@@ -11,6 +11,10 @@
   （固定窗口），超限立即返回 RATE_LIMITED（不等队）。
 - ``processing_timeout``：单次真实处理的最长秒数，超时抛错且结果不会被复用。
 - ``singleflight``：是否对“同一业务 + 同一资源”的并发请求做合并处理。
+
+在此之上还有一层全服务共享的 ``GlobalConfig``：全局同时在途数上限 +
+全局单位时间放行上限，三个业务合计触顶即拒（不排队），与各业务自己的
+额度同时生效、互不绕过。
 """
 
 from __future__ import annotations
@@ -108,11 +112,44 @@ def _apply_env_overrides(cfg: BusinessConfig) -> BusinessConfig:
 
 
 @dataclass(frozen=True)
+class GlobalConfig:
+    """全服务共享的容量保护配置（叠在各业务限制之上，触发即拒、不排队）。
+
+    - ``max_concurrency``：所有业务合计允许同时在途（排队+执行）的处理数上限。
+    - ``rate_limit`` / ``rate_window``：所有业务合计每 ``rate_window``
+      秒最多放行的请求数（固定窗口）。
+    """
+
+    max_concurrency: int = 12
+    rate_limit: int = 50
+    rate_window: float = 1.0
+
+
+DEFAULT_GLOBAL_CONFIG = GlobalConfig()
+
+
+def _apply_global_env_overrides(cfg: GlobalConfig) -> GlobalConfig:
+    """从环境变量读取 BP_GLOBAL_{FIELD} 形式的覆盖项。"""
+    changes: dict[str, object] = {}
+    raw = os.getenv("BP_GLOBAL_MAX_CONCURRENCY")
+    if raw is not None:
+        changes["max_concurrency"] = int(raw)
+    raw = os.getenv("BP_GLOBAL_RATE_LIMIT")
+    if raw is not None:
+        changes["rate_limit"] = int(raw)
+    raw = os.getenv("BP_GLOBAL_RATE_WINDOW")
+    if raw is not None:
+        changes["rate_window"] = float(raw)
+    return replace(cfg, **changes) if changes else cfg
+
+
+@dataclass(frozen=True)
 class Settings:
-    """全部业务维度的配置集合。"""
+    """全部业务维度的配置集合 + 全局容量保护配置。"""
 
     businesses: dict[str, BusinessConfig]
     default: BusinessConfig
+    global_limit: GlobalConfig = DEFAULT_GLOBAL_CONFIG
 
     def get(self, business: str) -> BusinessConfig:
         """返回业务配置，未注册则返回兜底配置的副本。"""
@@ -128,4 +165,8 @@ def load_settings() -> Settings:
         name: _apply_env_overrides(cfg)
         for name, cfg in BUSINESS_DEFAULTS.items()
     }
-    return Settings(businesses=businesses, default=DEFAULT_CONFIG)
+    return Settings(
+        businesses=businesses,
+        default=DEFAULT_CONFIG,
+        global_limit=_apply_global_env_overrides(DEFAULT_GLOBAL_CONFIG),
+    )
